@@ -3,9 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import time
+from pathlib import Path
 
 import numpy as np
+
+# Support direct script execution: `python benchmarks/benchmark_vectorized_tree.py`
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.vectorized_tree import VectorizedArrayTree
 
