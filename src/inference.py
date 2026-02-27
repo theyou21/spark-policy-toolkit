@@ -153,6 +153,79 @@ def apply_policy_scorer_antipattern(
     return working_df.mapInPandas(score_rows, schema=output_schema)
 
 
+def apply_policy_scorer_jvm_reference(
+    df: "DataFrame",
+    feature_cols: Sequence[str],
+    out_col: str,
+    *,
+    max_depth: int = 7,
+    max_bins: int = 64,
+    seed: int = 11,
+) -> "DataFrame":
+    """JVM-only throughput reference using Spark MLlib DecisionTreeClassifier.
+
+    This provides a JVM baseline for inference throughput comparisons. It is not
+    an uplift-equivalent model and returns scalar class predictions.
+    """
+    if not feature_cols:
+        raise ValueError("feature_cols must contain at least one feature name.")
+    if not out_col:
+        raise ValueError("out_col must be non-empty.")
+    if out_col in df.columns:
+        raise ValueError(f"out_col '{out_col}' already exists in DataFrame.")
+    if max_depth < 1:
+        raise ValueError("max_depth must be >= 1.")
+    if max_bins < 2:
+        raise ValueError("max_bins must be >= 2.")
+
+    missing = [col for col in feature_cols if col not in df.columns]
+    if missing:
+        raise ValueError(f"feature_cols not found in DataFrame: {missing}")
+
+    from pyspark.ml.classification import DecisionTreeClassifier
+    from pyspark.ml.feature import VectorAssembler
+    from pyspark.sql import functions as F
+
+    safe_feature_cols = [f"__jvm_feat_{idx}" for idx in range(len(feature_cols))]
+    working_df = df
+    for src_col, dst_col in zip(feature_cols, safe_feature_cols):
+        working_df = working_df.withColumn(
+            dst_col,
+            F.coalesce(F.nanvl(F.col(src_col).cast("double"), F.lit(0.0)), F.lit(0.0)),
+        )
+
+    label_col = "__jvm_label"
+    features_col = "__jvm_features"
+    working_df = working_df.withColumn(
+        label_col,
+        F.when(F.col(safe_feature_cols[0]) > F.lit(0.0), F.lit(1.0)).otherwise(F.lit(0.0)),
+    )
+
+    assembler = VectorAssembler(
+        inputCols=safe_feature_cols,
+        outputCol=features_col,
+        handleInvalid="keep",
+    )
+    assembled_df = assembler.transform(working_df)
+
+    classifier = DecisionTreeClassifier(
+        featuresCol=features_col,
+        labelCol=label_col,
+        predictionCol=out_col,
+        rawPredictionCol="__jvm_raw_prediction",
+        probabilityCol="__jvm_probability",
+        maxDepth=max_depth,
+        maxBins=max_bins,
+        seed=seed,
+    )
+    model = classifier.fit(assembled_df)
+
+    return model.transform(assembled_df).select(
+        *[F.col(name) for name in df.columns],
+        F.col(out_col).cast("double").alias(out_col),
+    )
+
+
 def generate_synthetic_dataframe(
     spark: "SparkSession",
     n_rows: int,
@@ -233,6 +306,7 @@ def run_policy_scorer_benchmark(
     missing_rate: float = 0.1,
     partitions: int = 64,
     include_antipattern: bool = True,
+    include_jvm_reference: bool = True,
 ) -> None:
     """Run synthetic throughput benchmark for all available scorer paths."""
     feature_cols = [f"f{i}" for i in range(n_features)]
@@ -295,6 +369,18 @@ def run_policy_scorer_benchmark(
                 feature_cols=feature_cols,
                 out_col="score_antipattern",
                 simulate_spark_from_json=True,
+            ),
+        )
+
+    if include_jvm_reference:
+        run_one(
+            "jvm_decision_tree_ref",
+            apply_policy_scorer_jvm_reference(
+                df=df,
+                feature_cols=feature_cols,
+                out_col="score_jvm_reference",
+                max_depth=max(1, min(depth, 12)),
+                max_bins=max(16, min(256, n_rows // 1000 if n_rows >= 1000 else 16)),
             ),
         )
 

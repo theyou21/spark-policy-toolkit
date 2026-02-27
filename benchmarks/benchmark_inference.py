@@ -26,6 +26,7 @@ def main() -> None:
     parser.add_argument("--missing-rate", type=float, default=0.1)
     parser.add_argument("--partitions", type=int, default=64)
     parser.add_argument("--no-antipattern", action="store_true")
+    parser.add_argument("--no-jvm-reference", action="store_true")
     args = parser.parse_args()
 
     spark = (
@@ -45,6 +46,7 @@ def main() -> None:
             missing_rate=args.missing_rate,
             partitions=args.partitions,
             include_antipattern=not args.no_antipattern,
+            include_jvm_reference=not args.no_jvm_reference,
         )
     finally:
         spark.stop()

@@ -2,10 +2,11 @@
 # MAGIC %md
 # MAGIC # Spark Policy Toolkit — Databricks Benchmark
 # MAGIC
-# MAGIC Self-contained notebook that benchmarks the three policy-scorer inference paths:
+# MAGIC Self-contained notebook that benchmarks four policy-scorer inference paths:
 # MAGIC - **mapInPandas** — broadcast forest, vectorized NumPy scoring
 # MAGIC - **mapInArrow** — broadcast forest, PyArrow RecordBatch scoring
 # MAGIC - **anti-pattern** — per-row JSON parse + re-build (intentionally slow baseline)
+# MAGIC - **JVM DecisionTree reference** — Spark MLlib `DecisionTreeClassifier` throughput reference
 # MAGIC
 # MAGIC Upload this notebook to a Databricks workspace and attach to a cluster. No extra packages are required beyond what ships with Databricks Runtime.
 
@@ -27,6 +28,7 @@ N_TREES       = 50        # trees in the forest
 MISSING_RATE  = 0.1       # fraction of NaN in feature columns
 PARTITIONS    = 64        # Spark repartition count
 INCLUDE_ANTIPATTERN = True  # set False to skip the slow baseline
+INCLUDE_JVM_REFERENCE = True  # set False to skip JVM Spark MLlib reference
 
 # COMMAND ----------
 
@@ -387,6 +389,61 @@ def apply_policy_scorer_antipattern(df, forest, feature_cols, out_col, *, simula
     return working_df.mapInPandas(score_rows, schema=output_schema)
 
 
+def apply_policy_scorer_jvm_reference(df, feature_cols, out_col, *, max_depth=7, max_bins=64, seed=11):
+    if not feature_cols:
+        raise ValueError("feature_cols must contain at least one feature name.")
+    if not out_col:
+        raise ValueError("out_col must be non-empty.")
+    if out_col in df.columns:
+        raise ValueError(f"out_col '{out_col}' already exists in DataFrame.")
+
+    missing = [c for c in feature_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"feature_cols not found in DataFrame: {missing}")
+
+    from pyspark.ml.classification import DecisionTreeClassifier
+    from pyspark.ml.feature import VectorAssembler
+
+    safe_feature_cols = [f"__jvm_feat_{idx}" for idx in range(len(feature_cols))]
+    working_df = df
+    for src_col, dst_col in zip(feature_cols, safe_feature_cols):
+        working_df = working_df.withColumn(
+            dst_col,
+            F.coalesce(F.nanvl(F.col(src_col).cast("double"), F.lit(0.0)), F.lit(0.0)),
+        )
+
+    label_col = "__jvm_label"
+    features_col = "__jvm_features"
+    working_df = working_df.withColumn(
+        label_col,
+        F.when(F.col(safe_feature_cols[0]) > F.lit(0.0), F.lit(1.0)).otherwise(F.lit(0.0)),
+    )
+
+    assembler = VectorAssembler(
+        inputCols=safe_feature_cols,
+        outputCol=features_col,
+        handleInvalid="keep",
+    )
+    assembled_df = assembler.transform(working_df)
+
+    classifier = DecisionTreeClassifier(
+        featuresCol=features_col,
+        labelCol=label_col,
+        predictionCol=out_col,
+        rawPredictionCol="__jvm_raw_prediction",
+        probabilityCol="__jvm_probability",
+        maxDepth=max_depth,
+        maxBins=max_bins,
+        seed=seed,
+    )
+    model = classifier.fit(assembled_df)
+
+    return model.transform(assembled_df).select(
+        *[F.col(name) for name in df.columns],
+        F.col(out_col).cast("double").alias(out_col),
+    )
+
+
 print("Scorer entry-points defined.")
 
 # COMMAND ----------
@@ -517,6 +574,16 @@ try:
     ))
 except Exception as exc:
     print(f"mapInArrow: skipped ({exc})")
+
+# --- JVM DecisionTree reference ---
+if INCLUDE_JVM_REFERENCE:
+    run_one("jvm_decision_tree_ref", apply_policy_scorer_jvm_reference(
+        df=df,
+        feature_cols=feature_cols,
+        out_col="score_jvm_reference",
+        max_depth=max(1, min(DEPTH, 12)),
+        max_bins=max(16, min(256, N_ROWS // 1000 if N_ROWS >= 1000 else 16)),
+    ))
 
 # --- anti-pattern ---
 if INCLUDE_ANTIPATTERN:
