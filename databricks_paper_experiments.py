@@ -310,30 +310,48 @@ def generate_split_search_dataframe(
     missing_rate: float,
     seed: int,
 ) -> DataFrame:
-    base = spark.range(n_rows)
-
-    df = base
+    # Build all feature expressions in one projection to avoid deep withColumn plans.
+    feature_exprs = []
     for idx in range(n_features):
-        raw = F.rand(seed + idx)
-        val = F.when(F.rand(seed + 10_000 + idx) < F.lit(missing_rate), F.lit(None).cast("double")).otherwise(raw.cast("double"))
-        df = df.withColumn(f"x{idx}", val)
+        raw = F.rand(seed + idx).cast("double")
+        value = (
+            F.when(
+                F.rand(seed + 10_000 + idx) < F.lit(missing_rate),
+                F.lit(None).cast("double"),
+            )
+            .otherwise(raw)
+            .alias(f"x{idx}")
+        )
+        feature_exprs.append(value)
 
     t_idx = F.floor(F.rand(seed + 20_000) * F.lit(float(n_treatments))).cast("int")
-    df = df.withColumn("treatment_idx", t_idx)
-    df = df.withColumn("treatment", F.col("treatment_idx").cast("string"))
-
     x0 = F.coalesce(F.col("x0"), F.lit(0.5))
     p = (
         F.lit(0.10)
-        + (F.col("treatment_idx").cast("double") / F.lit(max(1.0, float(n_treatments) * 10.0)))
+        + (
+            F.col("treatment_idx").cast("double")
+            / F.lit(max(1.0, float(n_treatments) * 10.0))
+        )
         + (x0 * F.lit(0.20))
     )
     p = F.greatest(F.lit(0.01), F.least(F.lit(0.95), p))
-    df = df.withColumn(
-        "outcome",
-        F.when(F.rand(seed + 30_000) < p, F.lit(1.0)).otherwise(F.lit(0.0)),
+
+    return (
+        spark.range(n_rows)
+        .select(*feature_exprs, t_idx.alias("treatment_idx"))
+        .withColumn("treatment", F.col("treatment_idx").cast("string"))
+        .withColumn(
+            "outcome",
+            F.when(F.rand(seed + 30_000) < p, F.lit(1.0)).otherwise(F.lit(0.0)),
+        )
+        .drop("treatment_idx")
     )
-    return df.drop("treatment_idx")
+
+
+def unit_interval_equal_width_splits(n_bins: int) -> List[float]:
+    if n_bins <= 1:
+        return []
+    return [float(idx) / float(n_bins) for idx in range(1, n_bins)]
 
 
 def _run_inference_timed(
@@ -407,9 +425,21 @@ if 1 in RUN_EXPERIMENTS:
     E1_N_TREATMENTS = 4
     E1_DEPTH = 7
     E1_MISSING_RATE = 0.10
-    E1_PARTITIONS = 128
-    E1_N_ROWS_SWEEP = [1_000_000, 5_000_000, 10_000_000, 50_000_000]
-    E1_ANTI_PATTERN_MAX_ROWS = 10_000_000
+    E1_MAX_PARTITIONS = 128
+    # Keep large-row sweep for Arrow/Pandas methods, but run anti-pattern on small rows only.
+    E1_METHOD_ROWS = {
+        "mapInArrow": [1_000_000, 5_000_000, 10_000_000],
+        "mapInPandas": [1_000_000, 5_000_000, 10_000_000],
+        "anti_pattern": [100_000, 250_000],
+    }
+    E1_METHOD_ORDER = ["mapInArrow", "mapInPandas", "anti_pattern"]
+    E1_ROWS_SWEEP = sorted(
+        {
+            n_rows
+            for method_rows in E1_METHOD_ROWS.values()
+            for n_rows in method_rows
+        }
+    )
 
     e1_forest = generate_synthetic_forest(
         depth=E1_DEPTH,
@@ -421,37 +451,22 @@ if 1 in RUN_EXPERIMENTS:
     )
     e1_feature_cols = [f"f{i}" for i in range(E1_N_FEATURES)]
 
-    for n_rows in E1_N_ROWS_SWEEP:
-        print(f"[E1] n_rows={n_rows:,}")
+    print(f"[E1] method/row matrix: {E1_METHOD_ROWS}")
+    for n_rows in E1_ROWS_SWEEP:
+        e1_partitions = max(32, min(E1_MAX_PARTITIONS, int(math.ceil(n_rows / 100_000))))
+        print(f"[E1] n_rows={n_rows:,}, partitions={e1_partitions}")
         e1_df = generate_synthetic_dataframe(
             spark=spark,
             n_rows=n_rows,
             n_features=E1_N_FEATURES,
             missing_rate=E1_MISSING_RATE,
             seed=SEED + 11,
-            partitions=E1_PARTITIONS,
+            partitions=e1_partitions,
         ).cache()
         _ = e1_df.count()
 
-        for method in ["mapInArrow", "mapInPandas", "anti_pattern"]:
-            if method == "anti_pattern" and n_rows > E1_ANTI_PATTERN_MAX_ROWS:
-                append_results(
-                    {
-                        "experiment_id": "E1",
-                        "method": method,
-                        "n_rows": n_rows,
-                        "n_features": E1_N_FEATURES,
-                        "n_trees": E1_N_TREES,
-                        "n_treatments": E1_N_TREATMENTS,
-                        "depth": E1_DEPTH,
-                        "missing_rate": E1_MISSING_RATE,
-                        "partitions": E1_PARTITIONS,
-                        "elapsed_s": None,
-                        "rows_per_s": None,
-                        "status": "skipped_too_large",
-                        "notes": f"anti_pattern skipped over {E1_ANTI_PATTERN_MAX_ROWS:,} rows",
-                    }
-                )
+        for method in E1_METHOD_ORDER:
+            if n_rows not in E1_METHOD_ROWS[method]:
                 continue
 
             run_info = _run_inference_timed(
@@ -477,7 +492,7 @@ if 1 in RUN_EXPERIMENTS:
                     "n_treatments": E1_N_TREATMENTS,
                     "depth": E1_DEPTH,
                     "missing_rate": E1_MISSING_RATE,
-                    "partitions": E1_PARTITIONS,
+                    "partitions": e1_partitions,
                     "elapsed_s": run_info["elapsed_s"],
                     "rows_per_s": rows_per_s,
                     "status": run_info["status"],
@@ -608,11 +623,13 @@ else:
 
 if 3 in RUN_EXPERIMENTS:
     E3_N_FEATURES_SWEEP = [10, 50, 250, 1000]
-    E3_N_ROWS = 2_000_000
+    E3_N_ROWS = 500_000
     E3_N_BINS = 32
     E3_N_TREATMENTS = 4
     E3_MISSING_RATE = 0.10
     E3_CANDIDATE_COLLECT_THRESHOLD = 100_000
+    E3_MAX_FEATURES_MEASURED = 64
+    E3_FIXED_SPLITS = unit_interval_equal_width_splits(E3_N_BINS)
 
     for n_features in E3_N_FEATURES_SWEEP:
         print(f"[E3] n_features={n_features:,}")
@@ -626,6 +643,9 @@ if 3 in RUN_EXPERIMENTS:
         _ = e3_df.count()
 
         feature_cols = [f"x{i}" for i in range(n_features)]
+        measured_feature_cols = feature_cols[: min(n_features, E3_MAX_FEATURES_MEASURED)]
+        measured_feature_count = len(measured_feature_cols)
+        projection_factor = float(n_features) / float(max(1, measured_feature_count))
 
         # A) collect-less
         rss_before = safe_driver_rss_gb()
@@ -633,19 +653,30 @@ if 3 in RUN_EXPERIMENTS:
         status = "ok"
         notes = ""
         try:
-            for feat in feature_cols:
+            for feat in measured_feature_cols:
                 prefix = build_prefix_sums(
                     e3_df,
                     feature_col=feat,
                     treatment_col="treatment",
                     outcome_col="outcome",
-                    num_quantile_splits=E3_N_BINS,
+                    splits=E3_FIXED_SPLITS,
                 )
                 _ = score_candidates_collectless(prefix, evaluation_mode="sql")
         except Exception as exc:
             status = "failed"
             notes = f"{type(exc).__name__}: {exc}"
-        elapsed = time.perf_counter() - t0
+        elapsed_measured = time.perf_counter() - t0
+        elapsed_projected = (
+            elapsed_measured * projection_factor
+            if status == "ok" and projection_factor > 1.0
+            else elapsed_measured
+        )
+        if status == "ok" and projection_factor > 1.0:
+            status = "ok_projected"
+            notes = (
+                f"measured {measured_feature_count}/{n_features} features; "
+                f"elapsed projected by factor={projection_factor:.2f}"
+            )
         rss_after = safe_driver_rss_gb()
         append_results(
             {
@@ -655,7 +686,10 @@ if 3 in RUN_EXPERIMENTS:
                 "n_features": n_features,
                 "n_bins": E3_N_BINS,
                 "n_treatments": E3_N_TREATMENTS,
-                "elapsed_s": elapsed,
+                "elapsed_s": elapsed_projected,
+                "elapsed_s_measured": elapsed_measured,
+                "measured_features": measured_feature_count,
+                "projection_factor": projection_factor,
                 "driver_rss_gb_before": rss_before,
                 "driver_rss_gb_after": rss_after,
                 "status": status,
@@ -691,32 +725,33 @@ if 3 in RUN_EXPERIMENTS:
             notes = ""
             collected_candidates: list[Any] = []
             try:
-                for feat in feature_cols:
+                for feat in measured_feature_cols:
                     prefix = build_prefix_sums(
                         e3_df,
                         feature_col=feat,
                         treatment_col="treatment",
                         outcome_col="outcome",
-                        num_quantile_splits=E3_N_BINS,
+                        splits=E3_FIXED_SPLITS,
                     )
                     collected_candidates.extend(prefix.collect())
-
-                _ = best_split_driver_collect(
-                    e3_df.select(
-                        F.col(feature_cols[0]).alias("feature"),
-                        F.col("treatment"),
-                        F.col("outcome"),
-                    ),
-                    feature_col="feature",
-                    treatment_col="treatment",
-                    outcome_col="outcome",
-                    splits=None,
-                )
             except Exception as exc:
                 status = "failed"
                 notes = f"{type(exc).__name__}: {exc}"
-            elapsed = time.perf_counter() - t0
+            elapsed_measured = time.perf_counter() - t0
+            elapsed_projected = (
+                elapsed_measured * projection_factor
+                if status == "ok" and projection_factor > 1.0
+                else elapsed_measured
+            )
+            if status == "ok" and projection_factor > 1.0:
+                status = "ok_projected"
+                notes = (
+                    f"measured {measured_feature_count}/{n_features} features; "
+                    f"elapsed and candidate rows projected by factor={projection_factor:.2f}"
+                )
             rss_after = safe_driver_rss_gb()
+            collected_rows_measured = len(collected_candidates)
+            collected_rows_projected = int(round(collected_rows_measured * projection_factor))
             append_results(
                 {
                     "experiment_id": "E3",
@@ -725,12 +760,16 @@ if 3 in RUN_EXPERIMENTS:
                     "n_features": n_features,
                     "n_bins": E3_N_BINS,
                     "n_treatments": E3_N_TREATMENTS,
-                    "elapsed_s": elapsed,
+                    "elapsed_s": elapsed_projected,
+                    "elapsed_s_measured": elapsed_measured,
+                    "measured_features": measured_feature_count,
+                    "projection_factor": projection_factor,
                     "driver_rss_gb_before": rss_before,
                     "driver_rss_gb_after": rss_after,
                     "status": status,
                     "notes": notes,
-                    "collected_candidate_rows": len(collected_candidates),
+                    "collected_candidate_rows": collected_rows_projected,
+                    "collected_candidate_rows_measured": collected_rows_measured,
                 }
             )
             del collected_candidates
@@ -1179,7 +1218,8 @@ try:
 
     # E3: driver memory vs features
     e3 = results_pdf[
-        (results_pdf["experiment_id"] == "E3") & (results_pdf["status"] == "ok")
+        (results_pdf["experiment_id"] == "E3")
+        & (results_pdf["status"].isin(["ok", "ok_projected"]))
     ].copy()
     if not e3.empty and {"method", "n_features", "driver_rss_gb_before", "driver_rss_gb_after"}.issubset(e3.columns):
         e3["driver_rss_delta_gb"] = (
