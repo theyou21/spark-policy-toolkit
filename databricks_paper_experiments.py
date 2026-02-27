@@ -142,8 +142,8 @@ def _discover_cluster_context() -> Dict[str, Any]:
         mem_status = sc._jsc.sc().getExecutorMemoryStatus()
         out["executor_memory_status_entries"] = int(mem_status.size())
         out["executor_count_estimate"] = max(0, int(mem_status.size()) - 1)
-    except Exception as exc:
-        out["executor_memory_status_error"] = str(exc)
+    except (Exception, AttributeError):
+        # Spark Connect (RemoteContext) doesn't expose _jsc
         out["executor_memory_status_entries"] = None
         out["executor_count_estimate"] = None
 
@@ -183,7 +183,8 @@ def _collect_job_and_stage_ids(job_group: str) -> tuple[list[int], list[int]]:
                     ids = []
             stage_ids.extend(int(v) for v in ids)
         return sorted(set(job_ids)), sorted(set(stage_ids))
-    except Exception:
+    except (Exception, AttributeError):
+        # Spark Connect (RemoteContext) doesn't support statusTracker()
         return [], []
 
 
@@ -364,7 +365,10 @@ def _run_inference_timed(
     job_group_prefix: str,
 ) -> Dict[str, Any]:
     job_group = f"{job_group_prefix}_{method}_{int(time.time() * 1000)}"
-    sc.setJobGroup(job_group, f"{job_group_prefix}-{method}")
+    try:
+        sc.setJobGroup(job_group, f"{job_group_prefix}-{method}")
+    except (Exception, AttributeError):
+        pass  # Spark Connect (RemoteContext) doesn't support setJobGroup
     rss_before = safe_driver_rss_gb()
     t0 = time.perf_counter()
     checksum = None
@@ -399,7 +403,10 @@ def _run_inference_timed(
     elapsed = time.perf_counter() - t0
     rss_after = safe_driver_rss_gb()
     job_ids, stage_ids = _collect_job_and_stage_ids(job_group)
-    sc.clearJobGroup()
+    try:
+        sc.clearJobGroup()
+    except (Exception, AttributeError):
+        pass  # Spark Connect (RemoteContext) doesn't support clearJobGroup
     return {
         "status": status,
         "notes": notes,
@@ -876,12 +883,20 @@ if 5 in RUN_EXPERIMENTS:
         num_quantile_splits=E5_N_BINS,
     )
 
+    # Extract the bin boundaries so driver_collect uses identical splits
+    # (approxQuantile is non-deterministic, so we must reuse the same boundaries).
+    e5_splits = sorted([
+        float(row["bin_boundary"])
+        for row in e5_prefix.select("bin_boundary").distinct().collect()
+        if row["bin_boundary"] is not None
+    ])
+
     e5_driver = best_split_driver_collect(
-        e5_df.select(F.col("x0").alias("feature"), "treatment", "outcome"),
-        feature_col="feature",
+        e5_df.select("x0", "treatment", "outcome"),
+        feature_col="x0",
         treatment_col="treatment",
         outcome_col="outcome",
-        splits=None,
+        splits=e5_splits,
     )
     e5_sql = score_candidates_collectless(e5_prefix, evaluation_mode="sql")
     e5_map = score_candidates_collectless(e5_prefix, evaluation_mode="mapInPandas")
