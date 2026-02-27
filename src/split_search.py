@@ -626,7 +626,7 @@ def _score_candidates_map_in_pandas(
         right_counts = pdf["right_count"].astype("float64").to_numpy()
         left_sums = pdf["left_sum"].astype("float64").to_numpy()
         right_sums = pdf["right_sum"].astype("float64").to_numpy()
-        treatments = pdf["treatment"].astype("string")
+        treatments = pdf["treatment"].astype(str).to_numpy()
 
         left_count_total = int(left_counts.sum())
         right_count_total = int(right_counts.sum())
@@ -635,7 +635,7 @@ def _score_candidates_map_in_pandas(
         min_left_group_count = int(left_counts.min()) if left_counts.size else 0
         min_right_group_count = int(right_counts.min()) if right_counts.size else 0
 
-        control_mask = (treatments == control_treatment).to_numpy()
+        control_mask = treatments == control_treatment
         non_control_mask = ~control_mask
         has_control = bool(control_mask.any())
         num_non_control = int(non_control_mask.sum())
